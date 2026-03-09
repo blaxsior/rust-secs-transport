@@ -1,0 +1,10 @@
+[package]
+name = "transport"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+num_enum = "0.7.5"
+secs-ii = { path = "../secs-ii" }
+tokio-serial = "5.4.5"
+tokio-util = { version = "0.7.18", features = ["codec"]}
