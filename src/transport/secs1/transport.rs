@@ -1,3 +1,5 @@
+use futures::{SinkExt, TryStreamExt, channel::mpsc};
+use secs_ii::item::Secs2Variant;
 use tokio_serial::SerialPort;
 use tokio_util::codec::Framed;
 
@@ -12,21 +14,37 @@ pub struct Secs1Transport {
 
 impl SecsTransport for Secs1Transport {
     async fn open(&mut self) -> Result<(), SecsTransportError> {
-        todo!()
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), SecsTransportError> {
         todo!()
     }
 
-    async fn recv<R: std::io::Read + ?Sized>(
-        &mut self,
-        item: &R,
-    ) -> Result<(), SecsTransportError> {
+    async fn send(&mut self, item: secs_ii::item::Secs2Variant) -> Result<(), SecsTransportError> {
         todo!()
     }
 
-    async fn send(&mut self, item: secs_ii::item::Secs2Variant) -> Result<(), SecsTransportError> {
-        todo!()
+    fn recv(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Result<secs_ii::item::Secs2Variant, SecsTransportError>>
+                + Send,
+        >,
+    > {
+        let (mut tx, rx) = mpsc::channel::<Result<Secs2Variant, SecsTransportError>>(10);
+
+        // 2. Producer task 생성
+        tokio::spawn(async move {
+            loop {
+                let item = Ok(Secs2Variant::Jis8); // 예시 데이터
+                if let Err(_) = tx.send(item).await {
+                    break; // Receiver가 drop되면 종료
+                }
+            }
+        });
+
+        Box::pin(rx.into_stream())
     }
 }
