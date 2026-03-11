@@ -1,24 +1,20 @@
-use std::{error::Error, fmt::Display};
+use futures::channel::mpsc::{RecvError, SendError};
+use thiserror::Error;
 
 ///
 /// SecsTransport 처리 시 예외
 ///
-#[derive(Debug)]
-pub struct SecsTransportError {
-    pub err_kind: SecsTransportErrKind,
-    pub description: String,
-}
+#[derive(Error, Debug)]
+pub enum SecsTransportError {
+    #[error("failed to connect")]
+    ConnectionFailed(#[source]Option<Box<dyn std::error::Error + Send + Sync>>),
 
-#[derive(Debug)]
-pub enum SecsTransportErrKind {
-    ConnectionFailed,
-}
+    #[error("failed to send message")]
+    SendFailed(#[source] SendError),
 
-impl Error for SecsTransportError {
-}
+    #[error("failed to receive message")]
+    RecvFailed(#[source] RecvError),
 
-impl Display for SecsTransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.description)
-    }
+    #[error("connection closed")]
+    ConnectionClosed
 }

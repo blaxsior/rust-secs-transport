@@ -1,6 +1,4 @@
-use futures::Stream;
 use secs_ii::item::Secs2Variant;
-use std::pin::Pin;
 
 use crate::transport::error::SecsTransportError;
 
@@ -17,7 +15,7 @@ pub trait SecsTransport {
     /// 
     fn recv(
         &mut self,
-    ) -> Pin<Box<dyn Stream<Item = Result<Secs2Variant, SecsTransportError>> + Send>>;
+    ) -> impl Future<Output = Result<Secs2Variant, SecsTransportError>>;
 
     ///
     /// 입력된 데이터를 전송한다.
