@@ -3,12 +3,15 @@ use num_enum::{IntoPrimitive, TryFromPrimitive};
 const WITHOUT_MSB: u8 = 0x7F;
 const MSB_ONLY: u8 = 0x80;
 
-pub struct Secs1Message {
+///
+/// SECS-I Block Transfer Protocol 중 사용되는 구조체
+/// 
+pub struct Secs1Block {
     pub header: [u8; 10],
     pub data: Vec<u8>,
 }
 
-impl Secs1Message {
+impl Secs1Block {
     pub fn rbit(&self) -> u8 {
         self.header[0] & MSB_ONLY
     }
@@ -42,11 +45,16 @@ impl Secs1Message {
     }
 }
 
+/// Secs-I 통신 Block Transfer Protocol에서 사용되는 코드
 #[derive(Debug, TryFromPrimitive, IntoPrimitive, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Secs1HandshakeCode {
+    /// request to send
     ENQ = 0b00000101,
+    /// ready to receive
     EOT = 0b00000100,
+    /// correct reception
     ACK = 0b00000110,
+    // incorrect reception
     NAK = 0b00010101,
 }
