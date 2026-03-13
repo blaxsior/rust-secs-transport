@@ -25,3 +25,14 @@ pub trait SecsTransport {
         item: Secs2Variant,
     ) -> impl std::future::Future<Output = Result<(), SecsTransportError>> + Send;
 }
+
+///
+/// SECS 통신 시 역할
+/// 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionMode {
+    /// 요청을 시도하는 측 (= master / host)
+    Active, // = Master
+    /// 요청에 응답하는 측 (= slave / eqp)
+    Passive
+}

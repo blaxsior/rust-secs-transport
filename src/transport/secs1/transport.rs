@@ -91,7 +91,7 @@ impl SecsTransport for Secs1Transport {
         self.sender
             .send(item)
             .await
-            .map_err(|e| SecsTransportError::SendFailed(e))
+            .map_err(|_| SecsTransportError::SendFailed)
     }
 
     async fn recv(&mut self) -> Result<Secs2Variant, SecsTransportError> {
