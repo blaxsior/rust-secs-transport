@@ -9,10 +9,12 @@ use tokio::{
 use tokio_serial::{SerialPortBuilder, SerialPortBuilderExt, SerialStream};
 
 use crate::transport::{
-    ConnectionMode, error::SecsTransportError, secs1::{
+    ConnectionMode,
+    error::{SecsTimeoutType, SecsTransportError},
+    secs1::{
         block::{Secs1Block, Secs1HandshakeCode},
         config::Secs1TransportConfig,
-    }
+    },
 };
 
 ///
@@ -180,9 +182,10 @@ impl Secs1LinkWorker {
             };
 
             if let Err(e) = result {
-                // 연결이 끊기는 등 에러가 발생한 경우 종료
-                // 추후 명세에 따라 개선 여지 있음
-                break;
+                match e {
+                    SecsTransportError::Timeout(SecsTimeoutType::T2) => {}
+                    _ => break,
+                }
             }
         }
     }
@@ -223,7 +226,7 @@ impl Secs1LinkWorker {
     }
 
     ///
-    /// ENQ 신호 송신 후 EOT 신호를 밭아 SEND 모드로 전이한다. 
+    /// ENQ 신호 송신 후 EOT 신호를 밭아 SEND 모드로 전이한다.
     ///
     fn switch_to_send(&mut self) {
         self.state = Secs1LinkState::SEND; // SEND 모드로 전이
@@ -259,12 +262,14 @@ impl Secs1LinkWorker {
 
     ///
     /// t2 timeout 발생 시 설정 대응
-    /// 
+    ///
     fn handle_t2_timeout(&mut self) {
+        // 기본 상태를 line control로 복구
+        self.state = Secs1LinkState::LINECONTROL;
         self.retry_count += 1;
 
         // FAILED_TO_SEND case
-        if self.retry_count >= self.config.t2_rty {
+        if self.retry_count > self.config.t2_rty {
             self.state = Secs1LinkState::IDLE; // retry 횟수 초과 시 idle 상태로 복귀
             self.retry_count = 0; // retry 0으로 초기화(필수는 아니나, 오류 막기 위한 목적)
         }
@@ -277,20 +282,22 @@ impl Secs1LinkWorker {
         let t2_timeout = tokio::time::sleep(self.config.t2_timeout);
         tokio::pin!(t2_timeout); // select!에서 쓰기 위해 고정(pin)
 
-        tokio::select! {
+        loop {
+            tokio::select! {
                 // t2 timeout이 발생한 케이스
                 _ = &mut t2_timeout => {
                     self.handle_t2_timeout();
-                    Ok(())
+                    return Ok(())
+                    // return Err(SecsTransportError::Timeout(SecsTimeoutType::T2))
                 }
 
-                // 데이터가 들어온 경우
+                    // 데이터가 들어온 경우
                 result = self.reader.recv() => {
                     let byte = result.ok_or_else(|| SecsTransportError::RecvFailed)?;
 
                     if let Ok(code) = Secs1HandshakeCode::try_from(byte) {
-                        // 나는 passive인데 상대에게 ENQ 받음 -> 양보 
-                        if code == Secs1HandshakeCode::ENQ && 
+                        // 나는 passive인데 상대에게 ENQ 받음 -> 양보
+                        if code == Secs1HandshakeCode::ENQ &&
                             self.config.mode == ConnectionMode::Passive {
                             return self.switch_to_receive().await;
                         } else if code == Secs1HandshakeCode::EOT {
@@ -298,19 +305,180 @@ impl Secs1LinkWorker {
                             self.switch_to_send();
                             return Ok(());
                         }
-                        // 이외 데이터는 버림
+                        // 이외 데이터는 버리고, 계속 반복 진행
                     }
                     // ENQ 이외의 신호라면 그냥 무시함
-                    Ok(())
                 }
+            }
         }
     }
 
-    async fn handle_receive(&self) -> Result<(), SecsTransportError> {
-        todo!()
+    async fn send_NAK(&mut self) -> Result<(), SecsTransportError> {
+        self.state = Secs1LinkState::IDLE;
+        self.writer
+            .write_u8(Secs1HandshakeCode::NAK.into())
+            .await
+            .map_err(|_| SecsTransportError::SendFailed)
     }
 
-    async fn handle_send(&self) -> Result<(), SecsTransportError> {
+    ///
+    /// T1 timeout 적용하여 잔여 데이터를 버린 후 NAK 전송한다.  
+    /// length / checksum error 발생 시 케이스
+    async fn send_NAK_with_T1(&mut self) -> Result<(), SecsTransportError> {
+        let t1_timeout = tokio::time::sleep(self.config.t1_timeout);
+        tokio::pin!(t1_timeout); // select!에서 쓰기 위해 고정(pin)
+
+        // t1_timeout이 지나기 전까지 들어오는 데이터는 모두 버림
+        while tokio::select! {
+            _ = &mut t1_timeout => false,
+            _ = self.reader.recv() => true,
+        } {}
+
+        // t1 지난 후 NAK 전송
+        self.send_NAK().await
+    }
+
+    async fn send_ACK(&mut self) -> Result<(), SecsTransportError> {
+        self.state = Secs1LinkState::IDLE;
+        self.writer
+            .write_u8(Secs1HandshakeCode::ACK.into())
+            .await
+            .map_err(|_| SecsTransportError::SendFailed)
+    }
+
+    /**
+     * T1 timeout을 두고 데이터를 읽어 온다.
+     */
+    async fn read_byte_with_T1(&mut self) -> Result<u8, SecsTransportError> {
+        let t1_timeout = tokio::time::sleep(self.config.t1_timeout);
+        tokio::pin!(t1_timeout); // select!에서 쓰기 위해 고정(pin)
+
+        // t1_timeout이 지나기 전까지 들어오는 데이터는 모두 버림
+        tokio::select! {
+            _ = &mut t1_timeout => {
+                self.send_NAK().await?; // connection failed 예외 등
+                Err(SecsTransportError::Timeout(SecsTimeoutType::T1)) // 일반 케이스
+            },
+            b = self.reader.recv() => b.ok_or_else(|| SecsTransportError::ConnectionClosed)
+        }
+    }
+
+    async fn handle_receive(&mut self) -> Result<(), SecsTransportError> {
+        let t2_timeout = tokio::time::sleep(self.config.t2_timeout);
+        tokio::pin!(t2_timeout); // select!에서 쓰기 위해 고정(pin)
+
+        // 1. T2 timer - EOT - length byte
+
+        // EOT - length byte 사이 시간에 대해 T2 설정
+        let length = tokio::select! {
+             // t2 timeout이 발생 -> NAK 전송
+            _ = &mut t2_timeout => {
+                // SEND NAK
+                self.send_NAK().await?;
+                Err(SecsTransportError::Timeout(SecsTimeoutType::T2))
+            }
+            // length byte을 받은 케이스
+            result = self.reader.recv() => {
+                result.ok_or_else(|| SecsTransportError::RecvFailed)
+            }
+        }?;
+
+        //2. length byte 검사. 이상하면 들어오는 문자 버림 후 IDLE
+        let is_length_invalid = length < 10 || length > 254;
+        if is_length_invalid {
+            return self.send_NAK_with_T1().await;
+        }
+
+        // 2. data 획득
+        let mut buf: Vec<u8> = Vec::with_capacity(length as usize);
+
+        // 데이터 읽기
+        for _ in 0..length {
+            let data = self.read_byte_with_T1().await?;
+            buf.push(data);
+        }
+
+        // checksum 획득
+        let mut checksum_bytes = [0u8; 2];
+        // checksum 읽기
+        for i in 0..2 {
+            let data = self.read_byte_with_T1().await?;
+            checksum_bytes[i] = data;
+        }
+        // checksum 획득
+        let checksum = u16::from_be_bytes(checksum_bytes);
+
+        // block 파싱
+        let block = Secs1Block::try_from(buf.as_slice())?;
+
+        // checksum이 다른 경우 -> 들어오는 문자 버림 후 IDLE
+        if !block.verify_checksum(checksum) {
+            return self.send_NAK_with_T1().await;
+        }
+        // checksum 같음
+        // received 처리
+        self.tx_to_upper
+            .send(block)
+            .await
+            .map_err(|_| SecsTransportError::SendFailed)?; // send error 발생 시 Result 예외
+        self.send_ACK().await
+    }
+
+    async fn handle_send(&mut self) -> Result<(), SecsTransportError> {
+        let (bytes, checksum) = {
+            let lock = self.buffer.lock().await;
+            let item = match lock.get(0) {
+                Some(v) => v,
+                None => {
+                    return Err(SecsTransportError::NothingToSend);
+                }
+            };
+
+            (item.to_bytes(), item.checksum())
+        };
+
+        let length = bytes.len();
+        if length < 10 || length > 254 {
+            return Err(SecsTransportError::BlockInvalid);
+        }
+
+        // 데이터 보냄
+        let mut frame = Vec::with_capacity(bytes.len() + 3);
+        frame.push(bytes.len() as u8);
+        frame.extend_from_slice(&bytes);
+        frame.extend_from_slice(&checksum.to_be_bytes());
+        self.writer
+            .write_all(&frame)
+            .await
+            .map_err(|e| SecsTransportError::SendFailed)?;
+
+        let t2_timeout = tokio::time::sleep(self.config.t2_timeout);
+        tokio::pin!(t2_timeout); // select!에서 쓰기 위해 고정(pin)
+
+        tokio::select! {
+            // t2 timeout이 발생 ->  line control로 복귀
+            _ = &mut t2_timeout => {
+                self.handle_t2_timeout();
+                return Ok(())
+            }
+
+                // 데이터가 들어온 경우
+            result = self.reader.recv() => {
+                let byte = result.ok_or_else(|| SecsTransportError::RecvFailed)?;
+
+                if let Ok(code) = Secs1HandshakeCode::try_from(byte) {
+                    // 나는 passive인데 상대에게 ENQ 받음 -> 양보
+                    if code == Secs1HandshakeCode::ACK {
+
+                    }
+                    // 이 데이터 아니면 timeout
+                }
+                // ENQ 이외의 신호는 timeout 발생
+                self.handle_t2_timeout();
+                return Ok(())
+            }
+        }
+
         todo!()
     }
 
