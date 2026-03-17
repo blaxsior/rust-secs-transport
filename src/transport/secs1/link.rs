@@ -462,16 +462,17 @@ impl Secs1LinkWorker {
                 return Ok(())
             }
 
-                // 데이터가 들어온 경우
+            // 들어온 데이터가 ACK
             result = self.reader.recv() => {
                 let byte = result.ok_or_else(|| SecsTransportError::RecvFailed)?;
 
                 if let Ok(code) = Secs1HandshakeCode::try_from(byte) {
-                    // 나는 passive인데 상대에게 ENQ 받음 -> 양보
+                    // ACK를 받은 경우
                     if code == Secs1HandshakeCode::ACK {
 
                     }
-                    // 이 데이터 아니면 timeout
+                    // ACK가 아님 -> 
+                  
                 }
                 // ENQ 이외의 신호는 timeout 발생
                 self.handle_t2_timeout();
