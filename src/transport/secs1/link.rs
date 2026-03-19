@@ -33,18 +33,25 @@ enum Secs1LinkState {
     COMPLETION,
 }
 
+pub trait Secs1Link {
+    async fn recv(&mut self) -> Result<Secs1Block, SecsTransportError>;
+    async fn send_all<Itr>(&mut self, blocks: Itr)
+    where
+        Itr: IntoIterator<Item = Secs1Block>;
+}
+
 ///
 /// Secs-I Block transfer 수준의 통신을 구현. block 조립은 담당하지 않는다.
 ///
 ///
-pub struct Secs1Link {
+pub struct Secs1LinkImpl {
     notifier: Arc<Notify>,
     send_buffer: Arc<Mutex<VecDeque<Secs1Block>>>,
     receiver: mpsc::Receiver<Secs1Block>,
     task: JoinHandle<()>,
 }
 
-impl Secs1Link {
+impl Secs1LinkImpl {
     pub fn new(
         config: Secs1TransportConfig,
         stream: SerialStream,
@@ -76,11 +83,13 @@ impl Secs1Link {
             task,
         })
     }
+}
 
+impl Secs1Link for Secs1LinkImpl {
     ///
     /// SECS-II 메시지 획득
     ///
-    pub async fn recv(&mut self) -> Result<Secs1Block, SecsTransportError> {
+    async fn recv(&mut self) -> Result<Secs1Block, SecsTransportError> {
         self.receiver
             .recv()
             .await
@@ -90,7 +99,7 @@ impl Secs1Link {
     ///
     /// SECS-I block 메시지를 전송한다.
     ///
-    pub async fn send_all<Itr>(&mut self, blocks: Itr)
+    async fn send_all<Itr>(&mut self, blocks: Itr)
     where
         Itr: IntoIterator<Item = Secs1Block>,
     {
@@ -103,7 +112,7 @@ impl Secs1Link {
     }
 }
 
-impl Drop for Secs1Link {
+impl Drop for Secs1LinkImpl {
     fn drop(&mut self) {
         // task thread 함께 종료 시도
         self.task.abort();
@@ -261,14 +270,15 @@ impl Secs1LinkWorker {
     }
 
     ///
-    /// t2 timeout 발생 시 설정 대응
+    /// flow control에서 t2 timeout 발생 시 설정 대응  
+    /// receive phase에서 발생하는 T2는 retry 대상이 아님
     ///
-    fn handle_t2_timeout(&mut self) {
+    fn handle_linecontrol_retry(&mut self) {
         // 기본 상태를 line control로 복구
         self.state = Secs1LinkState::LINECONTROL;
         self.retry_count += 1;
 
-        // FAILED_TO_SEND case
+        // FAILED SEND case
         if self.retry_count > self.config.t2_rty {
             self.state = Secs1LinkState::IDLE; // retry 횟수 초과 시 idle 상태로 복귀
             self.retry_count = 0; // retry 0으로 초기화(필수는 아니나, 오류 막기 위한 목적)
@@ -286,7 +296,7 @@ impl Secs1LinkWorker {
             tokio::select! {
                 // t2 timeout이 발생한 케이스
                 _ = &mut t2_timeout => {
-                    self.handle_t2_timeout();
+                    self.handle_linecontrol_retry();
                     return Ok(())
                     // return Err(SecsTransportError::Timeout(SecsTimeoutType::T2))
                 }
@@ -458,25 +468,23 @@ impl Secs1LinkWorker {
         tokio::select! {
             // t2 timeout이 발생 ->  line control로 복귀
             _ = &mut t2_timeout => {
-                self.handle_t2_timeout();
+                self.handle_linecontrol_retry();
                 return Ok(())
             }
 
-            // 들어온 데이터가 ACK
+            // 데이터 도작
             result = self.reader.recv() => {
                 let byte = result.ok_or_else(|| SecsTransportError::RecvFailed)?;
 
                 if let Ok(code) = Secs1HandshakeCode::try_from(byte) {
-                    // ACK를 받은 경우
+                    // ACK를 받은 경우 = BLOCK SENT, return to IDLE
                     if code == Secs1HandshakeCode::ACK {
-
+                        self.state = Secs1LinkState::IDLE;
+                    } else {
+                        self.handle_linecontrol_retry();
                     }
-                    // ACK가 아님 -> 
-                  
+                    return Ok(());
                 }
-                // ENQ 이외의 신호는 timeout 발생
-                self.handle_t2_timeout();
-                return Ok(())
             }
         }
 
@@ -511,12 +519,12 @@ impl Secs1LinkBuilder {
         }
     }
 
-    pub fn build(self) -> Result<Secs1Link, SecsTransportError> {
+    pub fn build(self) -> Result<Secs1LinkImpl, SecsTransportError> {
         let serial_stream = self
             .serial_config
             .open_native_async()
             .map_err(|e| SecsTransportError::ConnectionFailed(Some(Box::new(e))))?;
 
-        Secs1Link::new(self.secs_config, serial_stream)
+        Secs1LinkImpl::new(self.secs_config, serial_stream)
     }
 }

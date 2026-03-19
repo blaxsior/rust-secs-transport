@@ -6,9 +6,9 @@ pub mod error;
 pub mod secs1;
 
 pub trait SecsTransport {
-    fn open(&mut self) -> impl std::future::Future<Output = Result<(), SecsTransportError>> + Send; // 포트 열기 또는 소켓 Connect
-    fn close(&mut self)
-    -> impl std::future::Future<Output = Result<(), SecsTransportError>> + Send;
+    // fn open(&mut self) -> impl std::future::Future<Output = Result<(), SecsTransportError>> + Send; // 포트 열기 또는 소켓 Connect
+    // fn close(&mut self)
+    // -> impl std::future::Future<Output = Result<(), SecsTransportError>> + Send;
 
     ///
     /// 데이터를 stream 형식으로 수신한다.
