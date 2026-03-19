@@ -30,7 +30,7 @@ impl<Link: Secs1Link> SecsTransport for Secs1Transport<Link> {
     }
 
     async fn recv(&mut self) -> Result<Secs2Variant, SecsTransportError> {
-        self.recv().await;
+        self.link.recv();
         todo!();
     }
 }

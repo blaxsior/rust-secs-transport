@@ -35,9 +35,7 @@ enum Secs1LinkState {
 
 pub trait Secs1Link {
     async fn recv(&mut self) -> Result<Secs1Block, SecsTransportError>;
-    async fn send_all<Itr>(&mut self, blocks: Itr)
-    where
-        Itr: IntoIterator<Item = Secs1Block>;
+    async fn send(&mut self, blocks: Secs1Block) -> Result<(), SecsTransportError>;
 }
 
 ///
@@ -45,8 +43,7 @@ pub trait Secs1Link {
 ///
 ///
 pub struct Secs1LinkImpl {
-    notifier: Arc<Notify>,
-    send_buffer: Arc<Mutex<VecDeque<Secs1Block>>>,
+    sender: mpsc::Sender<Secs1Block>,
     receiver: mpsc::Receiver<Secs1Block>,
     task: JoinHandle<()>,
 }
@@ -58,17 +55,10 @@ impl Secs1LinkImpl {
     ) -> Result<Self, SecsTransportError> {
         // 1. 통신 통로 및 알림 장치 준비
         let (tx_to_upper, rx_to_upper) = mpsc::channel(256);
-        let notify = Arc::new(Notify::new());
-        let send_buffer = Arc::new(Mutex::new(VecDeque::new()));
+        let (tx_from_upper, rx_from_upper) = mpsc::channel(256);
 
         // worker 객체 생성
-        let mut worker = Secs1LinkWorker::new(
-            config,
-            stream,
-            Arc::clone(&send_buffer),
-            Arc::clone(&notify),
-            tx_to_upper,
-        );
+        let mut worker = Secs1LinkWorker::new(config, stream, tx_to_upper, rx_from_upper);
 
         // 3. 백그라운드 루프 실행
         let task: JoinHandle<()> = tokio::spawn(async move {
@@ -77,8 +67,7 @@ impl Secs1LinkImpl {
 
         // 4. 외부 인터페이스 객체 리턴
         Ok(Self {
-            send_buffer,
-            notifier: notify,
+            sender: tx_from_upper,
             receiver: rx_to_upper,
             task,
         })
@@ -97,18 +86,12 @@ impl Secs1Link for Secs1LinkImpl {
     }
 
     ///
-    /// SECS-I block 메시지를 전송한다.
+    /// SECS-I block 메시지를 전송 (전송 후 응답을 줄 수 있어야 함)
     ///
-    async fn send_all<Itr>(&mut self, blocks: Itr)
-    where
-        Itr: IntoIterator<Item = Secs1Block>,
-    {
-        let mut buf = self.send_buffer.lock().await;
-        for block in blocks {
-            buf.push_back(block);
-        }
-        // 데이터가 들어왔음을 알림
-        self.notifier.notify_one();
+    async fn send(&mut self, block: Secs1Block) -> Result<(), SecsTransportError> {
+        let result = self.sender.send(block).await;
+        // TODO: 데이터 전송 시 oneshot을 함께 보내 정상적으로 보내진 것이 맞는지 체크 필요
+        todo!();
     }
 }
 
@@ -125,26 +108,30 @@ impl Drop for Secs1LinkImpl {
 ///
 struct Secs1LinkWorker {
     config: Secs1TransportConfig,
+
     /// serial로 데이터 쓰기위한 부분
     writer: WriteHalf<SerialStream>,
     // serial로부터 읽은 데이터를 보관
     reader: mpsc::Receiver<u8>,
-    /// 상위에서 받은 데이터를 보관
-    buffer: Arc<Mutex<VecDeque<Secs1Block>>>,
-    notifier: Arc<Notify>,
+
+    /// 상위에서 받은 데이터를 다루는데 사용
+    rx_from_upper: mpsc::Receiver<Secs1Block>,
+
+    // 상위로 데이터 보내는데 사용
     tx_to_upper: mpsc::Sender<Secs1Block>,
     state: Secs1LinkState,
     retry_count: u8,
     handle: JoinHandle<()>,
+
+    pending_request: Option<Secs1Block>,
 }
 
 impl Secs1LinkWorker {
     pub fn new(
         config: Secs1TransportConfig,
         stream: SerialStream,
-        buffer: Arc<Mutex<VecDeque<Secs1Block>>>,
-        notifier: Arc<Notify>,
         tx_to_upper: mpsc::Sender<Secs1Block>,
+        rx_from_upper: mpsc::Receiver<Secs1Block>,
     ) -> Self {
         // 1. 스트림을 읽기/쓰기로 분리
         let (mut reader, writer) = tokio::io::split(stream);
@@ -169,14 +156,14 @@ impl Secs1LinkWorker {
 
         Self {
             config,
-            writer,     // 쓰기용만 소유
-            reader: rx, // 채널 수신단 소유
-            buffer,
-            notifier,
-            tx_to_upper, // 상위로 전달하기 위한 채널
+            writer,        // 쓰기용만 소유
+            reader: rx,    // 채널 수신단 소유
+            tx_to_upper,   // 상위로 전달하기 위한 채널
+            rx_from_upper, // 상위에서 받은 데이터를 보관
             state: Secs1LinkState::IDLE,
             retry_count: 0,
             handle,
+            pending_request: None,
         }
     }
     pub async fn run(&mut self) {
@@ -197,16 +184,6 @@ impl Secs1LinkWorker {
                 }
             }
         }
-    }
-
-    async fn has_remaining_data(&self) -> bool {
-        let buf = self.buffer.lock().await;
-        let has_data = !buf.is_empty();
-        // 데이터가 남아 있는 상태에서 알람이 있는 상태였다면 알람을 초기화, 재시도를 막음
-        if has_data {
-            self.notifier.notified().now_or_never();
-        }
-        has_data
     }
 
     ///
@@ -245,25 +222,23 @@ impl Secs1LinkWorker {
     /// idle state에서의 동작을 처리한다.
     ///
     async fn handle_idle(&mut self) -> Result<(), SecsTransportError> {
-        if self.has_remaining_data().await {
+        if self.pending_request.is_some() {
             return self.send_enq().await;
         }
 
         tokio::select! {
-            // block 수신 알림. handle_idle에 다시 진입하여 send_enq 시도(데이터 없는 경우 고려)
-            _ = self.notifier.notified() => {
-                Ok(())
+            // [가드 사용] pending_request가 None일 때만 채널에서 꺼냄
+            Some(req) = self.rx_from_upper.recv(), if self.pending_request.is_none() => {
+                self.pending_request = Some(req);
+                Ok(()) // 루프 재진입 -> 위 if문에서 send_enq 실행
             }
-            // 수신 데이터: 채널에서 데이터를 꺼낸다.
-            result = self.reader.recv() => {
-                let byte = result.ok_or_else(|| SecsTransportError::RecvFailed)?;
 
-                if let Ok(code) = Secs1HandshakeCode::try_from(byte) {
-                    if code == Secs1HandshakeCode::ENQ {
-                        return self.switch_to_receive().await;
-                    }
+            // [수신 대기] 보낼 게 없을 때(혹은 보낼 게 생기기 전) 상대방 ENQ 감시
+            result = self.reader.recv() => {
+                let byte = result.ok_or(SecsTransportError::RecvFailed)?;
+                if let Ok(Secs1HandshakeCode::ENQ) = Secs1HandshakeCode::try_from(byte) {
+                    return self.switch_to_receive().await;
                 }
-                // ENQ 이외의 신호라면 그냥 무시함
                 Ok(())
             }
         }
@@ -431,18 +406,16 @@ impl Secs1LinkWorker {
             .send(block)
             .await
             .map_err(|_| SecsTransportError::SendFailed)?; // send error 발생 시 Result 예외
+
         self.send_ACK().await
     }
 
     async fn handle_send(&mut self) -> Result<(), SecsTransportError> {
+
         let (bytes, checksum) = {
-            let lock = self.buffer.lock().await;
-            let item = match lock.get(0) {
-                Some(v) => v,
-                None => {
-                    return Err(SecsTransportError::NothingToSend);
-                }
-            };
+            let item = self
+                .pending_request.as_ref()
+                .ok_or_else(|| SecsTransportError::NothingToSend)?;
 
             (item.to_bytes(), item.checksum())
         };
@@ -481,17 +454,17 @@ impl Secs1LinkWorker {
                     // 현재 받은 block을 queue에서 제거
                     // return to IDLE
                     if code == Secs1HandshakeCode::ACK {
-                        self.buffer.lock().await.pop_front();
+                        self.pending_request.take(); // 사용한 데이터 버리기
                         self.state = Secs1LinkState::IDLE;
                     } else {
                         self.handle_linecontrol_retry();
                     }
                     return Ok(());
                 }
+                // 받은 데이터가 없음
+                return Err(SecsTransportError::RecvFailed);
             }
         }
-
-        todo!()
     }
 
     async fn handle_completion(&self) -> Result<(), SecsTransportError> {
