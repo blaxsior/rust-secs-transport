@@ -477,8 +477,11 @@ impl Secs1LinkWorker {
                 let byte = result.ok_or_else(|| SecsTransportError::RecvFailed)?;
 
                 if let Ok(code) = Secs1HandshakeCode::try_from(byte) {
-                    // ACK를 받은 경우 = BLOCK SENT, return to IDLE
+                    // ACK를 받은 경우 = BLOCK SENT
+                    // 현재 받은 block을 queue에서 제거
+                    // return to IDLE
                     if code == Secs1HandshakeCode::ACK {
+                        self.buffer.lock().await.pop_front();
                         self.state = Secs1LinkState::IDLE;
                     } else {
                         self.handle_linecontrol_retry();
