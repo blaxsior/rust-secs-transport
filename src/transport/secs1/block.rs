@@ -1,6 +1,6 @@
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-use crate::transport::error::SecsTransportError;
+use crate::transport::{error::SecsTransportError, secs1::config::DeviceId};
 
 const WITHOUT_MSB: u8 = 0x7F;
 const MSB_ONLY: u8 = 0x80;
@@ -16,17 +16,23 @@ pub struct Secs1Block {
 ///
 /// SECS-I block header을 표현하는 구조체
 ///
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Secs1BlockHeader {
+    /// reverse bit. eqp -> host인 경우 true
     pub rbit: bool,
-    pub device_id: u16,
+    /// 통신 대상 장치의 ID 값
+    pub device_id: DeviceId,
 
+    /// wait bit. primary msg에 대한 응답이 필요한 경우 true
     pub wbit: bool,
     pub stream: u8,
     pub function: u8,
 
+    /// end bit. 마지막 block인 경우 true
     pub ebit: bool,
+    /// block 번호. 단일 block은 0 허용, 아니면 1부터 시작하여 1씩 증가
     pub block_no: u16,
-
+    /// block transfer에 대한 트랜잭션을 식별하기 위한 byte 정보
     pub system_bytes: u32,
 }
 
@@ -34,8 +40,8 @@ impl Secs1BlockHeader {
     pub fn to_bytes(&self) -> [u8; 10] {
         let mut h = [0u8; 10];
 
-        h[0] = ((self.rbit as u8) << 7) | ((self.device_id >> 8) as u8 & WITHOUT_MSB);
-        h[1] = self.device_id as u8;
+        h[0] = ((self.rbit as u8) << 7) | ((self.device_id.0 >> 8) as u8 & WITHOUT_MSB);
+        h[1] = self.device_id.0 as u8;
 
         h[2] = ((self.wbit as u8) << 7) | (self.stream & WITHOUT_MSB);
         h[3] = self.function;
@@ -47,6 +53,26 @@ impl Secs1BlockHeader {
 
         h
     }
+
+    /// 마지막 block인지 여부
+    pub fn is_end(&self) -> bool {
+        self.ebit
+    }
+
+    /// 응답을 요구하는지 여부
+    pub fn need_reply(&self) -> bool {
+        self.wbit
+    }
+
+    /// primary message인지 여부
+    pub fn is_primary(&self) -> bool {
+        self.function % 2 == 1
+    }
+
+    /// 첫번째 block인지 여부
+    pub fn is_first_block(&self) -> bool {
+        self.block_no == 1 || (self.block_no == 0 && self.ebit)
+    }
 }
 
 impl TryFrom<[u8; 10]> for Secs1BlockHeader {
@@ -55,7 +81,7 @@ impl TryFrom<[u8; 10]> for Secs1BlockHeader {
     fn try_from(h: [u8; 10]) -> Result<Self, Self::Error> {
         Ok(Self {
             rbit: h[0] & MSB_ONLY != 0,
-            device_id: u16::from_be_bytes([h[0] & WITHOUT_MSB, h[1]]),
+            device_id: DeviceId(u16::from_be_bytes([h[0] & WITHOUT_MSB, h[1]])),
 
             wbit: h[2] & MSB_ONLY != 0,
             stream: h[2] & WITHOUT_MSB,
@@ -128,4 +154,9 @@ pub enum Secs1HandshakeCode {
     ACK = 0b00000110,
     // incorrect reception
     NAK = 0b00010101,
+}
+
+pub struct Secs1SendBlockRequest {
+    pub block: Secs1Block,
+    pub sender: tokio::sync::oneshot::Sender<Result<(), SecsTransportError>>,
 }

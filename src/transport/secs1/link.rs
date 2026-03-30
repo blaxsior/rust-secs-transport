@@ -1,9 +1,6 @@
-use std::{collections::VecDeque, sync::Arc};
-
-use futures::FutureExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, WriteHalf},
-    sync::{Mutex, Notify, mpsc},
+    sync::mpsc,
     task::JoinHandle,
 };
 use tokio_serial::{SerialPortBuilder, SerialPortBuilderExt, SerialStream};
@@ -12,7 +9,7 @@ use crate::transport::{
     ConnectionMode,
     error::{SecsTimeoutType, SecsTransportError},
     secs1::{
-        block::{Secs1Block, Secs1HandshakeCode},
+        block::{Secs1Block, Secs1HandshakeCode, Secs1SendBlockRequest},
         config::Secs1TransportConfig,
     },
 };
@@ -33,9 +30,9 @@ enum Secs1LinkState {
     COMPLETION,
 }
 
-pub trait Secs1Link {
-    async fn recv(&mut self) -> Result<Secs1Block, SecsTransportError>;
-    async fn send(&mut self, blocks: Secs1Block) -> Result<(), SecsTransportError>;
+pub trait Secs1Link: Send {
+    fn recv(&mut self) -> impl Future<Output = Result<Secs1Block, SecsTransportError>> + Send;
+    fn send(&mut self, block: Secs1Block) -> impl Future<Output = Result<(), SecsTransportError>> + Send;
 }
 
 ///
@@ -43,7 +40,7 @@ pub trait Secs1Link {
 ///
 ///
 pub struct Secs1LinkImpl {
-    sender: mpsc::Sender<Secs1Block>,
+    sender: mpsc::Sender<Secs1SendBlockRequest>,
     receiver: mpsc::Receiver<Secs1Block>,
     task: JoinHandle<()>,
 }
@@ -89,9 +86,13 @@ impl Secs1Link for Secs1LinkImpl {
     /// SECS-I block 메시지를 전송 (전송 후 응답을 줄 수 있어야 함)
     ///
     async fn send(&mut self, block: Secs1Block) -> Result<(), SecsTransportError> {
-        let result = self.sender.send(block).await;
-        // TODO: 데이터 전송 시 oneshot을 함께 보내 정상적으로 보내진 것이 맞는지 체크 필요
-        todo!();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), SecsTransportError>>();
+        let block_request = Secs1SendBlockRequest { block, sender: tx };
+        let result = self.sender.send(block_request).await;
+        result.map_err(|_| SecsTransportError::SendFailed)?;
+
+        // TODO: oneshot receive 실패 케이스에 대한 구체적 예외 처리
+        rx.await.map_err(|_| SecsTransportError::SendFailed)?
     }
 }
 
@@ -115,7 +116,7 @@ struct Secs1LinkWorker {
     reader: mpsc::Receiver<u8>,
 
     /// 상위에서 받은 데이터를 다루는데 사용
-    rx_from_upper: mpsc::Receiver<Secs1Block>,
+    rx_from_upper: mpsc::Receiver<Secs1SendBlockRequest>,
 
     // 상위로 데이터 보내는데 사용
     tx_to_upper: mpsc::Sender<Secs1Block>,
@@ -123,7 +124,7 @@ struct Secs1LinkWorker {
     retry_count: u8,
     handle: JoinHandle<()>,
 
-    pending_request: Option<Secs1Block>,
+    pending_request: Option<Secs1SendBlockRequest>,
 }
 
 impl Secs1LinkWorker {
@@ -131,7 +132,7 @@ impl Secs1LinkWorker {
         config: Secs1TransportConfig,
         stream: SerialStream,
         tx_to_upper: mpsc::Sender<Secs1Block>,
-        rx_from_upper: mpsc::Receiver<Secs1Block>,
+        rx_from_upper: mpsc::Receiver<Secs1SendBlockRequest>,
     ) -> Self {
         // 1. 스트림을 읽기/쓰기로 분리
         let (mut reader, writer) = tokio::io::split(stream);
@@ -177,11 +178,9 @@ impl Secs1LinkWorker {
                 Secs1LinkState::COMPLETION => self.handle_completion().await,
             };
 
+            // 만약 send 처리 과정에서 에러가 발생한 경우 link 레벨에 응답
             if let Err(e) = result {
-                match e {
-                    SecsTransportError::Timeout(SecsTimeoutType::T2) => {}
-                    _ => break,
-                }
+                self.completion(Err(e));
             }
         }
     }
@@ -244,6 +243,17 @@ impl Secs1LinkWorker {
         }
     }
 
+    fn completion(&mut self, result: Result<(), SecsTransportError>) {
+
+        // send 응답해야 하는 상태인 경우 응답 수행
+        if let Some(req) = self.pending_request.take() {
+            let _ = req.sender.send(result);
+        }
+
+        // 전체 작업 처리 후 IDLE 복귀
+        self.state = Secs1LinkState::IDLE;
+    }
+
     ///
     /// flow control에서 t2 timeout 발생 시 설정 대응  
     /// receive phase에서 발생하는 T2는 retry 대상이 아님
@@ -255,6 +265,7 @@ impl Secs1LinkWorker {
 
         // FAILED SEND case
         if self.retry_count > self.config.t2_rty {
+            self.completion(Err(SecsTransportError::Timeout(SecsTimeoutType::T2)));
             self.state = Secs1LinkState::IDLE; // retry 횟수 초과 시 idle 상태로 복귀
             self.retry_count = 0; // retry 0으로 초기화(필수는 아니나, 오류 막기 위한 목적)
         }
@@ -320,7 +331,8 @@ impl Secs1LinkWorker {
         } {}
 
         // t1 지난 후 NAK 전송
-        self.send_NAK().await
+        self.send_NAK().await?;
+        Err(SecsTransportError::Timeout(SecsTimeoutType::T1))
     }
 
     async fn send_ACK(&mut self) -> Result<(), SecsTransportError> {
@@ -411,13 +423,13 @@ impl Secs1LinkWorker {
     }
 
     async fn handle_send(&mut self) -> Result<(), SecsTransportError> {
-
         let (bytes, checksum) = {
             let item = self
-                .pending_request.as_ref()
+                .pending_request
+                .as_ref()
                 .ok_or_else(|| SecsTransportError::NothingToSend)?;
 
-            (item.to_bytes(), item.checksum())
+            (item.block.to_bytes(), item.block.checksum())
         };
 
         let length = bytes.len();
@@ -454,7 +466,7 @@ impl Secs1LinkWorker {
                     // 현재 받은 block을 queue에서 제거
                     // return to IDLE
                     if code == Secs1HandshakeCode::ACK {
-                        self.pending_request.take(); // 사용한 데이터 버리기
+                        self.completion(Ok(()));
                         self.state = Secs1LinkState::IDLE;
                     } else {
                         self.handle_linecontrol_retry();
