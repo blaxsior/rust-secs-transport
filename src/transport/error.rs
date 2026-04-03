@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::transport::secs1::config::DeviceId;
+
 ///
 /// SecsTransport 처리 시 예외
 ///
@@ -28,7 +30,10 @@ pub enum SecsTransportError {
 
     /// 보낼 아이템이 없음. 정말 특이한 상황
     #[error("no item to send")]
-    NothingToSend
+    NothingToSend,
+
+    #[error("unknown device id: {0:?}")]
+    UnknownDeviceId(DeviceId),
 }
 
 #[derive(Debug)]
